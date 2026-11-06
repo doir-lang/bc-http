@@ -15,6 +15,7 @@ private void count(void* context) {
 	++woken;
 }
 
+// wrapper: the host finds this hook by name and writes the URL through it
 /// Where the host writes the URL before calling `begin`.
 extern (C) export char* urlBuffer() {
 	return url.ptr;
@@ -40,6 +41,7 @@ extern (C) export int step() {
 	}
 }
 
+// wrapper: the host reads this hook by name to check the wake fired
 /// How many times the `setWake` hook was called.
 extern (C) export int wakes() {
 	return woken;

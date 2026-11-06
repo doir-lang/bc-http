@@ -17,6 +17,7 @@ module bc.jsonrpc;
 
 static import std.typecons;
 
+static import fp.string;
 static import fp.dynarray;
 static import fp.file;
 
@@ -46,10 +47,6 @@ void free(ref Reader r) {
 	r.start = 0;
 }
 
-private bool lower(char c, char want) {
-	return (c >= 'A' && c <= 'Z' ? cast(char) (c + 32) : c) == want;
-}
-
 // Where a message's body starts in its reader's buffer, and how long it is.
 private struct Frame {
 	size_t bodyStart, bodyLength;
@@ -67,9 +64,7 @@ private std.typecons.Nullable!Frame framed(ref const Reader r) @trusted {
 		size_t stop = line;
 		while (stop < end && bytes[stop] != '\r') ++stop;
 		auto header = bytes[line .. stop];
-		bool matches = header.length > field.length;
-		foreach (i, c; field) if (matches && !lower(header[i], c)) matches = false;
-		if (matches) {
+		if (header.length > field.length && fp.string.equalIgnoringAsciiCase(header[0 .. field.length], field)) {
 			foreach (c; header[field.length .. $]) {
 				if (c == ' ') continue;
 				if (c < '0' || c > '9') break;
@@ -120,7 +115,7 @@ const(char)[] next(ref Reader r) @trusted {
 		immutable kept = fp.dynarray.length(r.buffer) - r.start;
 		if (r.start) {
 			foreach (i; 0 .. kept) r.buffer[i] = r.buffer[r.start + i];
-			cast(void) fp.dynarray.popBackCount(r.buffer, r.start);
+			cast(void) fp.dynarray.removeLast(r.buffer, r.start);
 			r.start = 0;
 		}
 		// Once the header gives the length, room for the body is made once: growing per read copied a large document quadratically.
@@ -135,7 +130,7 @@ const(char)[] next(ref Reader r) @trusted {
 			return null;
 		}
 		immutable got = fp.file.readSome(r.fd, r.buffer[kept .. kept + size]);
-		cast(void) fp.dynarray.popBackCount(r.buffer, size - (got > 0 ? got : 0));
+		cast(void) fp.dynarray.removeLast(r.buffer, size - (got > 0 ? got : 0));
 		if (got <= 0) r.closed = true;
 	}
 }
@@ -154,13 +149,8 @@ const(char)[] next(ref Reader r) @trusted {
 bool send(int fd, const(char)[] body) {
 	char[48] header = "Content-Length: ";
 	size_t at = 16;
-	char[20] digits;
-	size_t n = 0, v = body.length;
-	do {
-		digits[n++] = cast(char) ('0' + v % 10);
-		v /= 10;
-	} while (v);
-	while (n) header[at++] = digits[--n];
+	char[fp.string.maxDecimalLength] digits;
+	foreach (c; fp.string.formatUnsigned(body.length, digits)) header[at++] = c;
 	foreach (c; "\r\n\r\n") header[at++] = c;
 	return fp.file.writeAll(fd, header[0 .. at]) && fp.file.writeAll(fd, body);
 }
@@ -265,7 +255,7 @@ unittest { // messages split across writes and run together come out whole and i
 	static import fp.testing;
 	Reader starved = Reader(big);
 	scope(exit) free(starved);
-	auto previous = fp.testing.beginRationedAllocator(0);
+	auto previous = fp.testing.limitAllocations(0);
 	assert(next(starved) is null && starved.closed);
-	fp.testing.endRationedAllocator(previous);
+	fp.testing.restoreAllocator(previous);
 }

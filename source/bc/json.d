@@ -55,6 +55,18 @@ struct Document {
 
 private enum uint dead = uint.max;
 
+// Bytes and nodes to splice in, positioned relative to themselves; a parent of `dead` is the container spliced into.
+private struct Fragment {
+	char* text = null;
+	Node* nodes = null;
+	bool refused;
+}
+
+private void release(ref Fragment f) {
+	fp.dynarray.free(f.text);
+	fp.dynarray.free(f.nodes);
+}
+
 /// Releases `d`'s text, nodes and ids, and the space its edits reuse, leaving it empty.
 ///
 /// Examples:
@@ -82,11 +94,8 @@ private uint indexOf(const(Document)* d, uint id) {
 private uint hexDigits(const(char)[] s, size_t at) {
 	uint v = 0;
 	foreach (c; s[at .. at + 4]) {
-		v <<= 4;
-		if (c >= '0' && c <= '9') v |= c - '0';
-		else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
-		else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
-		else return uint.max;
+		if (!fp.string.isHexDigit(c)) return uint.max;
+		v = v << 4 | fp.string.hexDigitValue(c);
 	}
 	return v;
 }
@@ -344,7 +353,7 @@ Parsed parse(const(char)[] text) {
 		ok = p.at == text.length;
 	}
 	if (ok) {
-		cast(void) fp.dynarray.popBackCount(result.document.text, text.length - p.written);
+		cast(void) fp.dynarray.removeLast(result.document.text, text.length - p.written);
 		immutable count = fp.dynarray.length(result.document.nodes);
 		ok = fp.dynarray.growToSize(result.document.ids, count) !is null;
 		if (ok) foreach (i; 0 .. count) result.document.ids[i] = cast(uint) i;
@@ -466,13 +475,10 @@ std.typecons.Nullable!long integer(Value v) {
 	if (kind(v) != Kind.number) return Result.init;
 	auto s = source(v);
 	immutable negative = s[0] == '-';
-	ulong magnitude = 0;
-	foreach (c; s[negative .. $]) {
-		if (c < '0' || c > '9' || magnitude > long.max / 10) return Result.init;
-		magnitude = magnitude * 10 + (c - '0');
-	}
-	if (magnitude > cast(ulong) long.max + negative) return Result.init;
-	return Result(negative ? -cast(long) magnitude : cast(long) magnitude);
+	auto parsed = fp.string.parseUnsigned(s[negative .. $], 10);
+	if (parsed.isNull || parsed.get.value > cast(ulong) long.max + negative) return Result.init;
+	immutable magnitude = parsed.get.value;
+	return Result(negative ? cast(long) (0UL - magnitude) : cast(long) magnitude);
 }
 
 /// `v` as a boolean; null unless it is `true` or `false`.
@@ -506,9 +512,6 @@ std.typecons.Nullable!(char*) decode(Value v) {
 	alias Result = typeof(return);
 	auto s = view(v);
 	char* out_ = null;
-	bool add(const(char)[] piece) {
-		return piece.length == 0 || fp.string.concatenate(out_, piece) !is null;
-	}
 	size_t from = 0, i = 0;
 	while (i < s.length) {
 		if (s[i] != '\\') {
@@ -516,13 +519,13 @@ std.typecons.Nullable!(char*) decode(Value v) {
 			continue;
 		}
 		immutable u = unescape(s, i);
-		if (!add(s[from .. i]) || !add(u.bytes[0 .. u.length])) {
+		if (!fp.string.concatenate(out_, s[from .. i]) || !fp.string.concatenate(out_, u.bytes[0 .. u.length])) {
 			fp.string.free(out_);
 			return Result.init;
 		}
 		i = from = u.next;
 	}
-	if (!add(s[from .. $])) {
+	if (!fp.string.concatenate(out_, s[from .. $])) {
 		fp.string.free(out_);
 		return Result.init;
 	}
@@ -554,27 +557,24 @@ std.typecons.Nullable!(char*) pretty(ref const Document d, const(char)[] indent 
 
 // Appends node `n` laid out at nesting `depth` to `out_`. False if refused.
 private bool layOut(ref const Document d, uint n, size_t depth, const(char)[] indent, ref char* out_) {
-	bool put(const(char)[] s) {
-		return s.length == 0 || fp.string.concatenate(out_, s) !is null;
-	}
 	bool line(size_t level) {
-		if (!put("\n")) return false;
-		foreach (_; 0 .. level) if (!put(indent)) return false;
+		if (!fp.string.concatenate(out_, "\n")) return false;
+		foreach (_; 0 .. level) if (!fp.string.concatenate(out_, indent)) return false;
 		return true;
 	}
 	immutable node = d.nodes[n];
-	if ((node.kind != Kind.object && node.kind != Kind.array) || node.skip == n + 1) return put(d.text[node.start .. node.end]);
+	if ((node.kind != Kind.object && node.kind != Kind.array) || node.skip == n + 1) return fp.string.concatenate(out_, d.text[node.start .. node.end]);
 	immutable object = node.kind == Kind.object;
-	if (!put(object ? "{" : "[")) return false;
+	if (!fp.string.concatenate(out_, object ? "{" : "[")) return false;
 	for (uint k = n + 1; k < node.skip; k = d.nodes[k].skip) {
-		if ((k > n + 1 && !put(",")) || !line(depth + 1)) return false;
+		if ((k > n + 1 && !fp.string.concatenate(out_, ",")) || !line(depth + 1)) return false;
 		if (object) {
-			if (!put(d.text[d.nodes[k].start .. d.nodes[k].end]) || !put(": ")) return false;
+			if (!fp.string.concatenate(out_, d.text[d.nodes[k].start .. d.nodes[k].end]) || !fp.string.concatenate(out_, ": ")) return false;
 			++k;
 		}
 		if (!layOut(d, k, depth + 1, indent, out_)) return false;
 	}
-	return line(depth) && put(object ? "}" : "]");
+	return line(depth) && fp.string.concatenate(out_, object ? "}" : "]");
 }
 
 
@@ -684,23 +684,11 @@ Members members(Value v) {
 
 // --- editing -----------------------------------------------------------------
 
-// Bytes and nodes to splice in, positioned relative to themselves; a parent of `dead` is the container spliced into.
-private struct Fragment {
-	char* text = null;
-	Node* nodes = null;
-	bool refused;
-}
-
 // Empties `f` for the next edit, keeping its capacity.
 private void reuse(ref Fragment f) {
 	fp.dynarray.clear(f.text);
 	fp.dynarray.clear(f.nodes);
 	f.refused = false;
-}
-
-private void release(ref Fragment f) {
-	fp.dynarray.free(f.text);
-	fp.dynarray.free(f.nodes);
 }
 
 private void put(ref Fragment f, const(char)[] bytes) {
@@ -775,28 +763,10 @@ private void add(T)(ref Fragment f, T value) {
 	else static if (is(U == immutable Value)) copy(f, value);
 	else static if (is(T : const(char)[])) quoted(f, value);
 	else static if (__traits(isIntegral, T) && !is(U == immutable char) && !is(U == immutable wchar) && !is(U == immutable dchar)) {
-		static if (__traits(isUnsigned, T)) {
-			enum negative = false;
-			ulong magnitude = value;
-		} else {
-			immutable negative = value < 0;
-			ulong magnitude = negative ? -cast(ulong) cast(long) value : cast(ulong) value;
-		}
-		char[24] buffer;
-		size_t at = buffer.length;
-		do {
-			buffer[--at] = cast(char) ('0' + magnitude % 10);
-			magnitude /= 10;
-		} while (magnitude);
-		if (negative) buffer[--at] = '-';
-		leaf(f, Kind.number, buffer[at .. $]);
+		char[fp.string.maxDecimalLength] buffer;
+		static if (__traits(isUnsigned, T)) leaf(f, Kind.number, fp.string.formatUnsigned(value, buffer));
+		else leaf(f, Kind.number, fp.string.formatSigned(value, buffer));
 	} else static assert(0, "bc.json: cannot write a " ~ T.stringof);
-}
-
-// Grows `da`'s capacity to `size`, doubling so a run of edits stays amortized. False if refused.
-private bool room(T)(ref T* da, size_t size) {
-	immutable capacity = fp.dynarray.capacity(da);
-	return size <= capacity || fp.dynarray.reserve(da, size > capacity * 2 ? size : capacity * 2) !is null;
 }
 
 // Swaps bytes [at, at+cut) and nodes [first, first+drop) inside `parent` for `f`. Returns `f`'s first id, or `dead`, unchanged, on refusal.
@@ -808,7 +778,7 @@ private uint splice(ref Document d, uint parent, uint at, uint cut, uint first, 
 	immutable size_t bytes = fp.dynarray.length(d.text), count = fp.dynarray.length(d.nodes), ids = fp.dynarray.length(d.ids);
 	immutable size_t added = fp.dynarray.length(f.text), fresh = fp.dynarray.length(f.nodes);
 	assert(bytes - cut + added < uint.max && ids + fresh < dead, "bc.json: document too large");
-	if (!room(d.text, bytes - cut + added) || !room(d.nodes, count - drop + fresh) || !room(d.ids, ids + fresh)) {
+	if (!(fp.dynarray.reserveAtLeast(d.text, bytes - cut + added) !is null) || !(fp.dynarray.reserveAtLeast(d.nodes, count - drop + fresh) !is null) || !(fp.dynarray.reserveAtLeast(d.ids, ids + fresh) !is null)) {
 		d.refused = true;
 		return dead;
 	}
@@ -825,9 +795,9 @@ private uint splice(ref Document d, uint parent, uint at, uint cut, uint first, 
 	}
 	foreach (k; first .. first + drop) d.ids[d.nodes[k].id] = dead;
 
-	if (cut) cast(void) fp.dynarray.deleteRange(d.text, at, cut);
+	if (cut) cast(void) fp.dynarray.removeRange(d.text, at, cut);
 	if (added) core.stdc.string.memcpy(fp.dynarray.insertUninitialized(d.text, at, added), f.text, added);
-	if (drop) cast(void) fp.dynarray.deleteRange(d.nodes, first, drop);
+	if (drop) cast(void) fp.dynarray.removeRange(d.nodes, first, drop);
 	if (fresh) {
 		auto slots = fp.dynarray.insertUninitialized(d.nodes, first, fresh);
 		immutable container = parent == dead ? dead : d.nodes[parent].id;
@@ -877,6 +847,7 @@ Value set(T)(ref Document d, T value) {
 	return Value(&d, splice(d, dead, 0, cast(uint) fp.dynarray.length(d.text), 0, cast(uint) fp.dynarray.length(d.nodes), *f));
 }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Replaces all of `d` with an empty object or array, and returns it as `set` does.
 ///
 /// Examples:
@@ -888,6 +859,7 @@ Value set(T)(ref Document d, T value) {
 /// ---
 Value setObject(ref Document d) { return set(d, Empty(Kind.object)); }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Ditto
 Value setArray(ref Document d) { return set(d, Empty(Kind.array)); }
 
@@ -943,6 +915,7 @@ Value set(T)(Value object, const(char)[] key, T value) {
 	return Value(d, id == dead ? dead : id + 1);
 }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Sets member `key` of `object` to an empty object or array, and returns it as `set` does.
 ///
 /// Examples:
@@ -956,6 +929,7 @@ Value set(T)(Value object, const(char)[] key, T value) {
 /// ---
 Value setObject(Value object, const(char)[] key) { return set(object, key, Empty(Kind.object)); }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Ditto
 Value setArray(Value object, const(char)[] key) { return set(object, key, Empty(Kind.array)); }
 
@@ -1013,6 +987,7 @@ Value appendAll(R)(Value array, R values) {
 	return Value(d, splice(*d, a, d.nodes[a].end - 1, 0, d.nodes[a].skip, 0, *f));
 }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Appends an empty object or array to `array`, and returns it as `append` does.
 ///
 /// Examples:
@@ -1025,6 +1000,7 @@ Value appendAll(R)(Value array, R values) {
 /// ---
 Value appendObject(Value array) { return append(array, Empty(Kind.object)); }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Ditto
 Value appendArray(Value array) { return append(array, Empty(Kind.array)); }
 
@@ -1058,6 +1034,7 @@ Value insert(T)(Value array, size_t i, T value) {
 	return Value(d, splice(*d, a, d.nodes[before].start, 0, before, 0, *f));
 }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Inserts an empty object or array into `array` before element `i`, and returns it as `insert` does.
 ///
 /// Examples:
@@ -1069,6 +1046,7 @@ Value insert(T)(Value array, size_t i, T value) {
 /// ---
 Value insertObject(Value array, size_t i) { return insert(array, i, Empty(Kind.object)); }
 
+// wrapper: names a JSON container kind for the generic operation
 /// Ditto
 Value insertArray(Value array, size_t i) { return insert(array, i, Empty(Kind.array)); }
 
@@ -1165,13 +1143,13 @@ unittest { // parsing minifies, rejects what is not one value, and reads numbers
 	assert(integer(root(keys.document)["a\"b"]).get == 1 && integer(root(keys.document)["é"]).get == 2);
 	assert(integer(root(keys.document)["ab"]).get == 3 && !exists(root(keys.document)["a"]));
 
-	auto previous = fp.testing.beginRationedAllocator(0);
+	auto previous = fp.testing.limitAllocations(0);
 	assert(parse("[1]").status == Status.refused && decode(root(escaped.document)).isNull && decode(r["list"][1]).isNull);
-	fp.testing.endRationedAllocator(previous);
+	fp.testing.restoreAllocator(previous);
 	for (size_t budget = 1;; ++budget) {
-		previous = fp.testing.beginRationedAllocator(budget);
+		previous = fp.testing.limitAllocations(budget);
 		auto starved = parse(`[1,{"a":[2]}]`);
-		fp.testing.endRationedAllocator(previous);
+		fp.testing.restoreAllocator(previous);
 		scope(exit) free(starved.document);
 		if (starved.status == Status.ok) break;
 		assert(starved.status == Status.refused && starved.document.nodes is null && starved.document.text is null);
@@ -1186,9 +1164,9 @@ unittest { // pretty lays a document out, and iteration sees every member and el
 	assert(fp.string.slice(s.get) == "{\n\t\"a\": [\n\t\t1,\n\t\t[]\n\t],\n\t\"b\": {\n\t\t\"c\": \"x\"\n\t},\n\t\"d\": {}\n}");
 	Document empty;
 	assert(pretty(empty).get is null);
-	auto previous = fp.testing.beginRationedAllocator(0);
+	auto previous = fp.testing.limitAllocations(0);
 	assert(pretty(p.document).isNull);
-	fp.testing.endRationedAllocator(previous);
+	fp.testing.restoreAllocator(previous);
 
 	char[8] seen;
 	size_t count = 0;
@@ -1203,22 +1181,22 @@ unittest { // edits keep the text minified and the index right, values stay vali
 	Document d;
 	scope(exit) free(d);
 	auto o = setObject(d);
-	set(o, "id", 1);
+	assert(exists(set(o, "id", 1)));
 	auto tags = setArray(o, "tags");
-	set(o, "ok", true);
-	append(tags, "a");
+	assert(exists(set(o, "ok", true)));
+	assert(exists(append(tags, "a")));
 	auto inner = appendObject(tags);
-	set(inner, "deep", null);
-	insert(tags, 0, 0u);
+	assert(exists(set(inner, "deep", null)));
+	assert(exists(insert(tags, 0, 0u)));
 	assert(!d.refused && json(d) == `{"id":1,"tags":[0,"a",{"deep":null}],"ok":true}` && consistent(d));
 	assert(view(tags[1]) == "a" && boolean(o["ok"]).get);
 
-	replace(tags, -5);
+	assert(exists(replace(tags, -5)));
 	assert(json(d) == `{"id":1,"tags":-5,"ok":true}` && consistent(d) && !exists(inner) && !exists(inner["deep"]));
 	assert(integer(tags).isNull && integer(o["tags"]).get == -5);
-	replace(o["tags"], Value(&d, o.id));
+	assert(exists(replace(o["tags"], Value(&d, o.id))));
 	assert(json(d) == `{"id":1,"tags":{"id":1,"tags":-5,"ok":true},"ok":true}` && consistent(d));
-	set(o, "copy", o["tags"]["tags"]);
+	assert(exists(set(o, "copy", o["tags"]["tags"])));
 	assert(json(d) == `{"id":1,"tags":{"id":1,"tags":-5,"ok":true},"ok":true,"copy":-5}` && consistent(d));
 
 	assert(remove(o["tags"]["id"]) && remove(o["copy"]) && remove(o["tags"]["ok"]));
@@ -1236,29 +1214,29 @@ unittest { // edits keep the text minified and the index right, values stay vali
 	assert(json(d) == `[1,3,3,[1,3]]` && integer(bulk).get == 3 && consistent(d));
 	auto fresh = setArray(appendObject(a), "x");
 	static immutable bool[2] flags = [true, false];
-	appendAll(fresh, flags[]);
-	append(fresh, null);
+	assert(exists(appendAll(fresh, flags[])));
+	assert(exists(append(fresh, null)));
 	assert(json(d) == `[1,3,3,[1,3],{"x":[true,false,null]}]` && consistent(d));
 	assert(remove(a[4]) && remove(a[3]) && remove(a[2]) && json(d) == `[1,3]` && consistent(d));
-	insertArray(a, 2);
-	insertObject(a, 1);
-	set(d, a[2]);
+	assert(exists(insertArray(a, 2)));
+	assert(exists(insertObject(a, 1)));
+	assert(exists(set(d, a[2])));
 	assert(json(d) == `3` && consistent(d) && !exists(a));
 
 	auto p = parse(`{"params": {"limit": 5, "trace": true}}`);
 	scope(exit) free(p.document);
 	auto params = root(p.document)["params"];
-	set(params, "limit", "ten");
+	assert(exists(set(params, "limit", "ten")));
 	assert(remove(params["trace"]) && json(p.document) == `{"params":{"limit":"ten"}}` && consistent(p.document));
-	set(params, "x\ty", ulong.max);
+	assert(exists(set(params, "x\ty", ulong.max)));
 	assert(json(p.document) == `{"params":{"limit":"ten","x\ty":18446744073709551615}}` && integer(params["x\ty"]).isNull);
 
 	// Writing escapes what JSON requires, and reads back as written.
 	static immutable awkward = "\x01\"\\\n\r\t\U0001F600";
 	auto e = setObject(params, "e");
-	set(e, "s", awkward);
-	append(setArray(e, "a"), 1);
-	appendArray(e["a"]);
+	assert(exists(set(e, "s", awkward)));
+	assert(exists(append(setArray(e, "a"), 1)));
+	assert(exists(appendArray(e["a"])));
 	assert(source(e) == `{"s":"\u0001\"\\\n\r\t😀","a":[1,[]]}` && consistent(p.document));
 	auto back = decode(e["s"]);
 	scope(exit) fp.string.free(back.get);
@@ -1283,7 +1261,7 @@ unittest { // a refused edit changes nothing but sets `refused`, and later edits
 			if (wasLength) core.stdc.string.memcpy(was.ptr, json(d).ptr, wasLength);
 		}
 		bool kept(bool done) { return done || json(d) == was[0 .. wasLength]; }
-		auto previous = fp.testing.beginRationedAllocator(budget);
+		auto previous = fp.testing.limitAllocations(budget);
 		mark();
 		auto a = setArray(d);
 		assert(kept(exists(a)));
@@ -1300,7 +1278,7 @@ unittest { // a refused edit changes nothing but sets `refused`, and later edits
 		static immutable string[3] words = ["x", "y\n", "z"];
 		assert(kept(exists(appendAll(a, words[]))));
 		immutable removed = remove(a[0]);
-		fp.testing.endRationedAllocator(previous);
+		fp.testing.restoreAllocator(previous);
 		assert(consistent(d));
 		if (d.refused) continue;
 		assert(removed && json(d) == `[true,[1],"x","y\n","z"]`);
@@ -1310,12 +1288,11 @@ unittest { // a refused edit changes nothing but sets `refused`, and later edits
 	// Edits reuse the document's scratch space, so a run of them allocates only as the document grows, not once or twice per edit.
 	Document many;
 	scope(exit) free(many);
-	auto previous = fp.testing.beginRationedAllocator(100);
+	auto previous = fp.testing.limitAllocations(100);
 	auto list = setArray(many);
 	foreach (i; 0 .. 500) {
-		set(appendObject(list), "line", i);
-		append(list, "x");
+		assert(exists(set(appendObject(list), "line", i)) && exists(append(list, "x")));
 	}
-	fp.testing.endRationedAllocator(previous);
+	fp.testing.restoreAllocator(previous);
 	assert(!many.refused && length(list) == 1000 && integer(list[998]["line"]).get == 499 && consistent(many));
 }

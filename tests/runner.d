@@ -1,30 +1,14 @@
 module runner;
 
-import core.stdc.stdio : fprintf, printf, stderr;
-
-private enum modules = [
+private alias modules = imported!"std.meta".AliasSeq!(
 	"bc.json",
 	"bc.jsonrpc",
 	"bc.http.message",
 	"bc.http",
-];
+);
 
 private int runEveryTest() {
-	size_t total = 0;
-
-	static foreach(name; modules) {{
-		alias mod = mixin("imported!\"" ~ name ~ "\"");
-		alias tests = __traits(getUnitTests, mod);
-		cast(void) fprintf(stderr, "%s (%d tests)\n", name.ptr, cast(int) tests.length);
-		static foreach(i, test; tests) {
-			cast(void) fprintf(stderr, "  [%d] ", cast(int) i);
-			test();
-			cast(void) fprintf(stderr, "ok\n");
-			++total;
-		}
-	}}
-
-	cast(void) printf("bc-fetch: all %d tests passed.\n", cast(int) total);
+	cast(void) imported!"fp.testing".runTests!modules("bc-fetch");
 	return 0;
 }
 

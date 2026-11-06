@@ -48,6 +48,9 @@ jobs:
       - name: Check documentation examples
         run: python tools/doctest.py
 
+      - name: Lint layering, naming and wrappers
+        run: python tools/lint.py
+
       - name: Build static library
         run: dub build --config=library --compiler=ldc2
 
